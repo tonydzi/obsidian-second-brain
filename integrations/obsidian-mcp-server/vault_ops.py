@@ -23,7 +23,7 @@ import urllib.request
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 _VAULT_ENV = "OBSIDIAN_VAULT_PATH"
 
@@ -255,6 +255,28 @@ _RRF_SEMANTIC_WEIGHT = float(os.environ.get("OBSIDIAN_RRF_SEMANTIC_WEIGHT") or "
 # default because no measured sweep has backed one, and the weight already
 # converges the fusion to pure-semantic quality on the case sets that were run.
 _FUSE_LEX_DEPTH = int(os.environ.get("OBSIDIAN_RRF_LEX_DEPTH") or "25")
+# Link-graph reorder (discussion #342), OFF by default. A text ranker cannot see
+# that a short canonical note is what its derivatives point at: the relation is
+# structural, not textual. When on, personalized PageRank over the [[wikilink]]
+# graph is seeded from the top of the current ranking and fused back by RRF.
+# It only reorders the candidates search already found (never adds a note), the
+# first _PPR_HEAD positions stay where they are so a well-linked hub cannot push
+# a correct textual hit off the top, and _freshness_rerank still runs last.
+# Off means the code path below is skipped entirely: no link parsing, no graph,
+# byte-identical ranking. The synthetic corpus links every derivative to its
+# canonical note, so a gain there is necessary but not sufficient; it stays
+# behind the switch until it is checked on a real vault.
+_PPR_ENABLED = os.environ.get("OBSIDIAN_SEARCH_PPR", "0") != "0"
+_PPR_ALPHA = 0.85     # damping; restart probability 1 - alpha
+_PPR_ITERS = 20       # fixed power iterations
+_PPR_SEED_TOPK = 15   # how many top candidates seed the personalization vector
+_PPR_TOPM = 10        # how many notes by PPR mass vote in the fusion
+_PPR_HEAD = 5         # positions of the current ranking that never move
+_PPR_POOL = _FUSE_DEPTH  # candidates the reorder may draw from
+# Mass below this spreads no further and restarts at the seed, like a note with
+# no outgoing link. Without it the walk reached every note of a 10k-note test
+# graph and one reorder cost ~0.8 s; only the top of the mass ever votes.
+_PPR_EPS = 1e-4
 # The semantic index is built on demand and never invalidates itself, so a note
 # written after the last build is invisible to the semantic arm. On English
 # queries the lexical arm covers for that; on a query in another language it
@@ -420,8 +442,9 @@ _scan_cache_chars = 0
 def _scan_entry(md: Path, vault: Path):
     """Per-note scan inputs, cached until the file changes.
 
-    Returns (lowercased_text, title_low, length_norm, static_weight) or None when
-    the file is unreadable. `static_weight` folds together every query-independent
+    Returns (lowercased_text, title_low, length_norm, static_weight, age_days,
+    text, links) or None when the file is unreadable. `links` is the frozenset of
+    normalized wikilink targets when the link-graph reorder is on, else None. `static_weight` folds together every query-independent
     multiplier: de-weight prefix, type weight and stale-status fade.
     """
     global _scan_cache_chars
@@ -450,8 +473,17 @@ def _scan_entry(md: Path, vault: Path):
     sm = _STATUS_RE.search(text[:400])
     if sm and sm.group(1).lower() in _STALE_STATUSES:
         weight *= _STATUS_FADE
+    # Outgoing link targets ride along only when the link-graph reorder is on,
+    # so the default path never pays for the extra regex pass. A parse failure
+    # leaves the note without links rather than breaking search.
+    links = None
+    if _PPR_ENABLED:
+        try:
+            links = frozenset(_norm_link(t) for t in _wikilinks(text))
+        except Exception:
+            links = frozenset()
     entry = (low, md.stem.lower(), 1.0 + math.log1p(len(low) / 1000.0), weight,
-             _note_age_days(text, md), text)
+             _note_age_days(text, md), text, links)
 
     if hit is not None:
         _scan_cache_chars -= len(hit[1][0])
@@ -621,6 +653,9 @@ def search(query: str, *, limit: int = 6, semantic: Optional[bool] = None) -> Li
     # Every note the scan reached, scoring or not. The staleness check diffs
     # this against the index for free rather than walking the vault a second time.
     seen: List[str] = []
+    # Link graph for the optional reorder, collected from the same scan.
+    links_by_rel: Dict[str, frozenset] = {}
+    stem_to_rel: Dict[str, str] = {}
     truncated = False
     for i, md in enumerate(_iter_notes(vault)):
         if i >= _MAX_FILES_SCANNED:
@@ -630,7 +665,11 @@ def search(query: str, *, limit: int = 6, semantic: Optional[bool] = None) -> Li
         entry = _scan_entry(md, vault)
         if entry is None:
             continue
-        low, title_low, length_norm, static_weight, age_days, text = entry
+        low, title_low, length_norm, static_weight, age_days, text, links = entry
+        if _PPR_ENABLED:
+            stem_to_rel.setdefault(_nfc(md.stem).lower(), seen[-1])
+            if links:
+                links_by_rel[seen[-1]] = links
         # Sublinear term frequency + length normalization (BM25-style): a note that
         # repeats a term 50 times in passing should not outrank a short note that has
         # the term in its title. log1p saturates repeated mentions; dividing the body
@@ -669,6 +708,17 @@ def search(query: str, *, limit: int = 6, semantic: Optional[bool] = None) -> Li
             file=sys.stderr,
         )
     scored.sort(key=lambda r: r["score"], reverse=True)
+    if _PPR_ENABLED:
+        # Same two return paths as below, with the reorder over a deeper pool
+        # cut back to `limit` before the freshness rerank.
+        pool = max(limit, _PPR_POOL)
+        fused = _semantic_fuse(query, scored, vault, pool, enabled=semantic, scanned=seen)
+        if fused is None:
+            for r in scored:
+                r.pop("score", None)
+            fused = scored[:pool]
+        ranked = _ppr_reorder(fused, links_by_rel, stem_to_rel, limit)
+        return _freshness_rerank(ranked, vault, current_intent)
     fused = _semantic_fuse(query, scored, vault, limit, enabled=semantic, scanned=seen)
     if fused is not None:
         return _freshness_rerank(fused, vault, current_intent)
@@ -678,6 +728,92 @@ def search(query: str, *, limit: int = 6, semantic: Optional[bool] = None) -> Li
     # it used to skip it entirely, so keyless installs never got the status
     # fade the comment above promises for the lexical arm.
     return _freshness_rerank(scored[:limit], vault, current_intent)
+
+
+def _personalized_pagerank(
+    targets_of: Callable[[str], List[str]], seed: Dict[str, float],
+    alpha: float = _PPR_ALPHA, iters: int = _PPR_ITERS, eps: float = _PPR_EPS,
+) -> Dict[str, float]:
+    """Personalized PageRank by fixed power iteration, sparse over reached notes.
+
+    Mass flows along outgoing links; a note with no outgoing link, or holding
+    less than `eps`, returns its mass to the seed vector rather than spreading
+    it over the whole vault, so the walk stays local to the query."""
+    total = sum(seed.values())
+    if total <= 0:
+        return {}
+    seed = {u: w / total for u, w in seed.items()}
+    p = dict(seed)
+    for _ in range(iters):
+        nxt: Dict[str, float] = {}
+        dangling = 0.0
+        for u, m in p.items():
+            targets = targets_of(u) if m >= eps else None
+            if targets:
+                share = alpha * m / len(targets)
+                for v in targets:
+                    nxt[v] = nxt.get(v, 0.0) + share
+            else:
+                dangling += m
+        restart = alpha * dangling + (1.0 - alpha)
+        for u, w in seed.items():
+            nxt[u] = nxt.get(u, 0.0) + restart * w
+        p = nxt
+    return p
+
+
+def _rrf_positions(*ranked: List[int], k: int = _RRF_K) -> List[int]:
+    """RRF over lists of integer positions; ties go to the earlier position."""
+    score: Dict[int, float] = {}
+    for lst in ranked:
+        for rank, item in enumerate(lst):
+            score[item] = score.get(item, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(score, key=lambda item: (-score[item], item))
+
+
+def _ppr_reorder(
+    results: List[Dict[str, Any]], links_by_rel: Dict[str, frozenset],
+    stem_to_rel: Dict[str, str], limit: int, head: int = _PPR_HEAD,
+) -> List[Dict[str, Any]]:
+    """Reorder ranked results by a personalized-PageRank vote, top `head` pinned.
+
+    Seeds are the first _PPR_SEED_TOPK results, weighted 1/(K + rank). The
+    _PPR_TOPM notes with the most PPR mass vote by RRF over the tail positions;
+    a voted note outside `results` is ignored, so nothing is ever added. Any
+    failure returns the incoming order, so search cannot break on it."""
+    try:
+        # Resolved lazily: only notes the walk reaches pay for their links.
+        out_adj: Dict[str, List[str]] = {}
+
+        def targets_of(rel: str) -> List[str]:
+            hit = out_adj.get(rel)
+            if hit is None:
+                hit = []
+                for link in sorted(links_by_rel.get(rel) or ()):
+                    t = stem_to_rel.get(link)
+                    if t is not None and t != rel and t not in hit:
+                        hit.append(t)
+                out_adj[rel] = hit
+            return hit
+        seed = {r["path"]: 1.0 / (_RRF_K + i)
+                for i, r in enumerate(results[:_PPR_SEED_TOPK])}
+        mass = _personalized_pagerank(targets_of, seed)
+        lane = [u for u, m in sorted(mass.items(), key=lambda t: (-t[1], t[0])) if m > 0]
+        lane = lane[:_PPR_TOPM]
+        kept, tail = results[:head], results[head:]
+        kept_paths = {r["path"] for r in kept}
+        tail_pos = {}
+        for i, r in enumerate(tail):
+            tail_pos.setdefault(r["path"], i)
+        votes = [tail_pos[u] for u in lane if u in tail_pos and u not in kept_paths]
+        if not votes:
+            return results[:limit]
+        order = _rrf_positions(list(range(len(tail))), votes)
+        return (kept + [tail[i] for i in order])[:limit]
+    except Exception as exc:  # never break search on the optional reorder
+        print(f"warning: link-graph reorder failed ({exc}); kept the search order",
+              file=sys.stderr)
+        return results[:limit]
 
 
 def read_note(
